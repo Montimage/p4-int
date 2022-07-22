@@ -83,6 +83,11 @@ header int_l4s_mark_drop_t{
    bit<16> nb_drop;
 }
 
+header int_q_ingress_packets_t{
+   bit<8> q_id;
+   bit<24> value;
+}
+
 #define INT_NODE_NONE     0b000
 #define INT_NODE_SOURCE   0b001
 #define INT_NODE_SINK     0b010
@@ -111,7 +116,8 @@ struct int_metadata{
    bit<16> dst_port;
 
    //specific for L4S
-   l4s_stat_t l4s;
+   bool is_ll_traffic;  //either L4S flow or classic (best effort) flow
+   bit<32> stat_l4s_index;
 }
 
 // Enough room for previous 4 nodes worth of data
@@ -139,7 +145,6 @@ struct int_headers {
    int_data_t                previous_data;
 }
 
-
 error
 {
 	INTShimLenTooShort,
@@ -148,16 +153,12 @@ error
 
 parser int_parser(packet_in packet, in bit<6> dscp, 
       in bit<32> src_ip, in bit<16> src_port, in bit<32> dst_ip, in bit<16> dst_port,
-      out int_headers hdr, inout int_metadata meta, in standard_metadata_t std_meta) {
+      out int_headers hdr, inout int_metadata meta, in standard_metadata_t std_meta, in bool is_ll_traffic ) {
 
    bit<32> hop_data_len;
 
    state start {
       log_msg("\n\n==INT new packet arrived =============");
-      //initialize l4s stat metric
-      meta.l4s.mark = 0;
-      meta.l4s.drop = 0;
-
       //remember the original dscp so that we can restore it when sinking its packet
       meta.dscp     = dscp;
       meta.src_ip   = src_ip;
@@ -172,6 +173,13 @@ parser int_parser(packet_in packet, in bit<6> dscp,
       meta.ingress_tstamp = std_meta.ingress_global_timestamp;
       meta.ingress_port   = (bit<16>)std_meta.ingress_port;
 
+      meta.is_ll_traffic  = is_ll_traffic;
+      if( is_ll_traffic ) {
+         meta.stat_l4s_index = 2; //index in registry
+      } else {
+         meta.stat_l4s_index = 0; //index in registry
+      }
+      meta.stat_l4s_index = 0; //TODO: to remove
       
       transition select(dscp){
          INT_IPv4_DSCP: parse_int;
@@ -289,14 +297,15 @@ control __config_transit( inout int_headers hdr, inout int_metadata meta, in sta
    }
 }
 
-const bit<32> INT_REPORT_MIRROR_SESSION_ID = 1;   // mirror session specyfing egress_port for cloned INT report packets, defined by switch CLI command   
-
-control __config_sink( inout int_headers hdr, inout int_metadata meta, in standard_metadata_t std_meta ) {
+const bit<32> REPORT_MIRROR_SESSION_ID = 500;
+control __config_sink( inout int_headers hdr, inout int_metadata meta, inout standard_metadata_t std_meta ) {
    action set_sink(bit<16> sink_reporting_port) {
       meta.int_node = meta.int_node | INT_NODE_SINK;
 
-      meta.sink_reporting_port = (bit<16>)sink_reporting_port; 
-      //clone3<metadata>(CloneType.I2E, INT_REPORT_MIRROR_SESSION_ID, meta);
+      //meta.sink_reporting_port = (bit<16>)sink_reporting_port; 
+      // FIXME: this works only on BMv2
+      //clone(CloneType.I2E, REPORT_MIRROR_SESSION_ID);
+      log_msg("==INT.config_sink: cloned packet");
    }
 
    //table used to activate/desactivate INT sink for particular egress port of the switch
@@ -317,7 +326,7 @@ control __config_sink( inout int_headers hdr, inout int_metadata meta, in standa
 
 
 
-control int_ingress(inout int_headers hdr, inout int_metadata meta, in standard_metadata_t std_meta) {
+control int_ingress(inout int_headers hdr, inout int_metadata meta, inout standard_metadata_t std_meta) {
    apply {
       //apply INT source logic on INT monitored flow
       __config_source.apply( hdr, meta, std_meta);
@@ -336,7 +345,6 @@ control int_ingress(inout int_headers hdr, inout int_metadata meta, in standard_
       __config_sink.apply( hdr, meta, std_meta );
    }
 }
-
 
 
 
@@ -367,12 +375,18 @@ control __sink(inout int_headers hdr, in int_metadata meta, inout standard_metad
       //we can be here 2 times: one for the orginal packet, 
       // another for the cloned packet (not ready yet) that will be sent to INT collector using UDP
       if (std_meta.instance_type == PKT_INSTANCE_TYPE_NORMAL && (meta.int_node & INT_NODE_SINK) != 0) {
+        //clone(CloneType.E2E, REPORT_MIRROR_SESSION_ID);
         // remove INT headers from the current packet
-        remove_int_header();
+        if( std_meta.egress_port != 3 ){
+           //FIXME: a hack here to keep INT in a packet when it goes out port 3 that is mirroring port
+           remove_int_header();
+        }
+
       }
       if (std_meta.instance_type == PKT_INSTANCE_TYPE_INGRESS_CLONE) {
         // prepare an INT report for the INT collector
-        //Int_report.apply(hdr, meta, standard_metadata);
+        //__report.apply(hdr, meta, standard_metadata);
+        log_msg("==CLONED packet");
       }
    }
 }
@@ -395,11 +409,17 @@ control __transit(inout int_headers hdr, inout int_metadata meta, in standard_me
         }
         action int_set_header_2() {
             hdr.hop_latency.setValid();
-            hdr.hop_latency.hop_latency = (bit<32>)(std_meta.egress_global_timestamp - meta.ingress_tstamp);
+            hdr.hop_latency.hop_latency = (bit<32>)(std_meta.egress_global_timestamp - meta.ingress_tstamp); //a timestamp, in microseconds
         }
         action int_set_header_3() {
             hdr.q_occupancy.setValid();
-            hdr.q_occupancy.q_id = 0; // qid not defined in v1model
+            //hdr.q_occupancy.q_id = std_meta.qid; // qid=0, not defined in v1model
+            //qid is not available in V1model => use is_ll_traffic (0 or 1) to distinguish 2 queues: 
+            // - 0 for classic, 1 for Low-latency queue
+            if( meta.is_ll_traffic )
+               hdr.q_occupancy.q_id  = 1;
+            else
+               hdr.q_occupancy.q_id  = 0;
             hdr.q_occupancy.q_occupancy = (bit<24>)std_meta.enq_qdepth;
         }
         action int_set_header_4() {
@@ -752,7 +772,9 @@ control __transit(inout int_headers hdr, inout int_metadata meta, in standard_me
 
 #define L4S_MARK_INDEX ((bit<32>)0)
 #define L4S_DROP_INDEX ((bit<32>)1)
-register <bit<16>>(2) l4s_stat_register;
+//index 0 and 1 for normal traffic
+//index 3 and 4 for LL traffic
+register <bit<16>>(4) l4s_stat_register;
 
 control __l4s(inout int_headers hdr, inout int_metadata meta, inout standard_metadata_t std_meta){
    bit<16> val;
@@ -762,24 +784,26 @@ control __l4s(inout int_headers hdr, inout int_metadata meta, inout standard_met
       //if( std_meta.egress_port == 
       //do no report if the packet will be dropped
       //TODO need to replace 2 by DROP_PORT ???
-      if( std_meta.egress_port != 2 ){
-         log_msg("==INT.L4S packet will be dropped");
-         return;
-      }
+      //if( std_meta.egress_port != 2 and std_meta.egress_port != 1 ){
+      //   log_msg("==INT.L4S packet will be dropped");
+      //   return;
+      //}
 
       if( hdr.int_header.instruction_mask & 0x00F0  != 0 ){
          hdr.l4s_mark_drop.setValid();
-
-         l4s_stat_register.read( val, L4S_MARK_INDEX );
-         log_msg("==L4S mark: {}", {val});
-         hdr.l4s_mark_drop.nb_mark = val;
-         //reset counter
-         l4s_stat_register.write( L4S_MARK_INDEX, 0 );
-
-         l4s_stat_register.read( val, L4S_DROP_INDEX );
-         log_msg("==L4S drop: {}", {val});
-         hdr.l4s_mark_drop.nb_drop = val;
-         l4s_stat_register.write( L4S_DROP_INDEX, 0 );
+         @atomic {
+            l4s_stat_register.read( val, L4S_MARK_INDEX + meta.stat_l4s_index );
+            log_msg("==L4S mark: {}", {val});
+            hdr.l4s_mark_drop.nb_mark = val;
+            //reset counter
+            l4s_stat_register.write( L4S_MARK_INDEX + meta.stat_l4s_index, 0 );
+         }
+         @atomic {
+            l4s_stat_register.read( val, L4S_DROP_INDEX + meta.stat_l4s_index );
+            log_msg("==L4S drop: {}", {val});
+            hdr.l4s_mark_drop.nb_drop = val;
+            l4s_stat_register.write( L4S_DROP_INDEX + meta.stat_l4s_index, 0 );
+         }
          
          //remember number of bytes to add
          meta.int_hdr_word_len = meta.int_hdr_word_len + 1;
@@ -838,24 +862,23 @@ control int_deparser(packet_out packet, in int_headers hdr) {
 
 action __incr_l4s_register( bit<32> index ){
    bit<16> val;
-   l4s_stat_register.read( val, index );
-   val = val + 1;
-   l4s_stat_register.write( index, val );
+   @atomic {
+      l4s_stat_register.read( val, index );
+      val = val + 1;
+      l4s_stat_register.write( index, val );
+   }
 
 }
 
 //specific control for stocking L4S metrics
 action int_l4s_mark(inout int_metadata meta){
-   meta.l4s.mark = 1;
    log_msg("==L4S mark");
-   __incr_l4s_register( L4S_MARK_INDEX );
+   __incr_l4s_register( L4S_MARK_INDEX + meta.stat_l4s_index );
 }
 
 action int_l4s_drop(inout int_metadata meta){
-   meta.l4s.drop = 1;
    log_msg("==L4S drop");
-   __incr_l4s_register( L4S_DROP_INDEX );
+   __incr_l4s_register( L4S_DROP_INDEX + meta.stat_l4s_index);
 }
-
 #endif
 

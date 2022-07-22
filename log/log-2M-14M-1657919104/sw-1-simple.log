@@ -1,0 +1,6 @@
+Creating a bridge using simple_switch: switch-int.json
+You disabled logging macros when building this binary; however, the log level is currenty set to include 'debug' and possibly 'trace' messages; therefore the logs will be missing most messages
+Calling target program-options parser
+Adding interface enp0s8 as port 1
+Adding interface enp0s10 as port 2
+simple_switch 1 returned code: 130

@@ -1,0 +1,5 @@
+Creating a bridge using simple_switch: switch-int.json
+Calling target program-options parser
+Adding interface enp0s8 as port 1
+Adding interface enp0s10 as port 2
+simple_switch 1 returned code: 130
